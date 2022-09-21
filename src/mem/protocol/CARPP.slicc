@@ -1,0 +1,6 @@
+protocol "CARPP";
+include "RubySlicc_interfaces.slicc";
+include "CARPP-msg.sm";
+include "CARPP-cache.sm";
+include "CARPP-dir.sm";
+include "CARPP-DMA.sm";

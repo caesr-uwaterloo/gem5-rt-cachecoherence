@@ -1,0 +1,6 @@
+protocol "PMSI_C2C";
+include "RubySlicc_interfaces.slicc";
+include "PMSI_C2C-msg.sm";
+include "PMSI_C2C-cache.sm";
+include "PMSI_C2C-dir.sm";
+include "PMSI_C2C-DMA.sm";

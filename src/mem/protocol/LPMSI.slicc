@@ -1,0 +1,6 @@
+protocol "LPMSI";
+include "RubySlicc_interfaces.slicc";
+include "LPMSI-msg.sm";
+include "LPMSI-cache.sm";
+include "LPMSI-dir.sm";
+include "LPMSI-DMA.sm";

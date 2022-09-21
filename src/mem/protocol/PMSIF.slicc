@@ -1,0 +1,6 @@
+protocol "PMSIF";
+include "RubySlicc_interfaces.slicc";
+include "PMSIF-msg.sm";
+include "PMSIF-cache.sm";
+include "PMSIF-dir.sm";
+include "PMSIF-DMA.sm";

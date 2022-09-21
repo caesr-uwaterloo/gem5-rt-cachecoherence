@@ -1,0 +1,6 @@
+protocol "CARP";
+include "RubySlicc_interfaces.slicc";
+include "CARP-msg.sm";
+include "CARP-cache.sm";
+include "CARP-dir.sm";
+include "CARP-DMA.sm";

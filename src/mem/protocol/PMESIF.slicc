@@ -1,0 +1,6 @@
+protocol "PMESIF";
+include "RubySlicc_interfaces.slicc";
+include "PMESIF-msg.sm";
+include "PMESIF-cache.sm";
+include "PMESIF-dir.sm";
+include "PMESIF-DMA.sm";

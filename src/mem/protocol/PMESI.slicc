@@ -1,0 +1,6 @@
+protocol "PMESI";
+include "RubySlicc_interfaces.slicc";
+include "PMESI-msg.sm";
+include "PMESI-cache.sm";
+include "PMESI-dir.sm";
+include "PMESI-DMA.sm";

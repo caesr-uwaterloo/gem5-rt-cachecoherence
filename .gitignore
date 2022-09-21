@@ -1,0 +1,5 @@
+build
+build/*/*
+m5out
+m5out/*/*
+*.out

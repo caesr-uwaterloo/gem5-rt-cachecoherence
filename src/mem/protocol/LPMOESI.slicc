@@ -1,0 +1,6 @@
+protocol "LPMOESI";
+include "RubySlicc_interfaces.slicc";
+include "LPMOESI-msg.sm";
+include "LPMOESI-cache.sm";
+include "LPMOESI-dir.sm";
+include "LPMOESI-DMA.sm";

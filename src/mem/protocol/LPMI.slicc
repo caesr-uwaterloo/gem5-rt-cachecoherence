@@ -1,0 +1,6 @@
+protocol "LPMI";
+include "RubySlicc_interfaces.slicc";
+include "LPMI-msg.sm";
+include "LPMI-cache.sm";
+include "LPMI-dir.sm";
+include "LPMI-DMA.sm";

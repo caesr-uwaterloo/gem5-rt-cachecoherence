@@ -1,0 +1,6 @@
+protocol "MESIF";
+include "RubySlicc_interfaces.slicc";
+include "MESIF-msg.sm";
+include "MESIF-cache.sm";
+include "MESIF-dir.sm";
+include "MESIF-DMA.sm";

@@ -1,0 +1,548 @@
+/*
+ * Copyright (c) 1999-2013 Mark D. Hill and David A. Wood
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are
+ * met: redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer;
+ * redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution;
+ * neither the name of the copyright holders nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+machine(Directory, "MSI Two Level directory protocol")
+ : DirectoryMemory * directory;
+   Cycles to_mem_ctrl_latency := 5;
+   Cycles directory_latency := 6;
+
+   MessageBuffer * requestToDir, network="From", virtual_network="2",
+        ordered="false", vnet_type="request";	
+
+	 MessageBuffer * requestToDir_WB, network="From", virtual_network="6",
+	 		  ordered="false", vnet_type="request";
+
+   MessageBuffer * responseToDir, network="From", virtual_network="4",
+        ordered="false", vnet_type="response";
+   MessageBuffer * responseFromDir, network="To", virtual_network="4",
+        ordered="false", vnet_type="response";
+{
+  // STATES
+  state_declaration(State, desc="Directory states", default="Directory_State_I") {
+    // Base states
+    I, AccessPermission:Read_Only, desc="dir is the owner and memory is up-to-date, all other copies are Invalid";
+    E, AccessPermission:Read_Only, desc="dir is the owner and memory is up-to-date, all other copies are Invalid";
+    S, AccessPermission:Read_Only, desc="dir is the owner and memory is up-to-date, all other copies are Invalid";
+		MS_D,AccessPermission:Read_Only, desc="lnsdf";
+    M, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
+    MM, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
+    MI, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
+
+    IM, AccessPermission:Busy, desc="Intermediate State I>M";
+    IE, AccessPermission:Busy, desc="Intermediate State I>M";
+		IS, AccessPermission:Busy, desc="lkndlfsn";
+  }
+
+  // Events
+  enumeration(Event, desc="Directory events") {
+    Fetch, desc="A memory fetch arrives";
+    Data, desc="writeback data arrives";
+    DataO, desc="writeback data arrives";
+    No_Data, desc="writeback data arrives";
+    Memory_Data, desc="Fetched data from memory arrives";
+    Memory_Ack, desc="Writeback Ack from memory arrives";
+//added by SS for dma
+    DMA_READ, desc="A DMA Read memory request";
+    DMA_WRITE, desc="A DMA Write memory request";
+		GETS, desc="A GETS request";
+		GETI, desc="A GETS request";
+    PUTM, desc="A putm arrives";
+    PUTE, desc="A putm arrives";
+		GETM, desc="A GETM request";
+		GETMO, desc="A lost GETM request preceeded by an UPG";
+		UPG, desc="A UPG request";
+  }
+
+  // TYPES
+
+  // DirectoryEntry
+  structure(Entry, desc="...", interface="AbstractEntry") {
+    State DirectoryState,          desc="Directory state";
+    NetDest Owner, desc="Owner of this block";
+  }
+
+  // TBE entries for DMA requests
+  structure(TBE, desc="TBE entries for outstanding DMA requests") {
+    Address PhysicalAddress, desc="physical address";
+    State TBEState,        desc="Transient State";
+    DataBlock DataBlk,     desc="Data to be written (DMA write only)";
+    int Len,               desc="...";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    bool isPresent(Address);
+    bool functionalRead(Packet *pkt);
+    int functionalWrite(Packet *pkt);
+  }
+
+
+  // ** OBJECTS **
+  TBETable TBEs, template="<Directory_TBE>", constructor="m_number_of_TBEs";
+
+  void set_tbe(TBE tbe);
+  void unset_tbe();
+  void wakeUpBuffers(Address a);
+
+  Entry getDirectoryEntry(Address addr), return_by_pointer="yes" {
+    Entry dir_entry := static_cast(Entry, "pointer", directory[addr]);
+
+    if (is_valid(dir_entry)) {
+      return dir_entry;
+    }
+
+    dir_entry :=  static_cast(Entry, "pointer",
+                              directory.allocate(addr, new Entry));
+    return dir_entry;
+  }
+
+  State getState(TBE tbe, Address addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (directory.isPresent(addr)) {
+      return getDirectoryEntry(addr).DirectoryState;
+    } else {
+      return State:I;
+    }
+  }
+
+  void setState(TBE tbe, Address addr, State state) {
+    if (is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+
+    if (directory.isPresent(addr)) {
+      getDirectoryEntry(addr).DirectoryState := state;
+    }
+  }
+
+  AccessPermission getAccessPermission(Address addr) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      DPRINTF(RubySlicc, "%s\n", Directory_State_to_permission(tbe.TBEState));
+      return Directory_State_to_permission(tbe.TBEState);
+    }
+
+    if(directory.isPresent(addr)) {
+      DPRINTF(RubySlicc, "%s\n", Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState));
+      return Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState);
+    }
+
+    DPRINTF(RubySlicc, "%s\n", AccessPermission:NotPresent);
+    return AccessPermission:NotPresent;
+  }
+
+  void functionalRead(Address addr, Packet *pkt) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      functionalMemoryRead(pkt);
+    }
+  }
+
+  int functionalWrite(Address addr, Packet *pkt) {
+    int num_functional_writes := 0;
+
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+        testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+
+    num_functional_writes := num_functional_writes + functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  void setAccessPermission(Address addr, State state) {
+    if (directory.isPresent(addr)) {
+      getDirectoryEntry(addr).changePermission(Directory_State_to_permission(state));
+    }
+  }
+
+
+
+  // ** OUT_PORTS **
+  out_port(responseNetwork_out, ResponseMsg, responseFromDir);
+
+  // ** IN_PORTS **
+
+	in_port(requestNetwork_in, RequestMsg, requestToDir, rank=0) {
+		if (requestNetwork_in.isReady()) {
+			peek(requestNetwork_in, RequestMsg) {
+				assert(in_msg.Destination.isElement(machineID));
+				if (in_msg.Type == CoherenceRequestType:GETS) {
+					trigger(Event:GETS, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:GETI) {
+					trigger(Event:GETI, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:GETM || in_msg.Type == CoherenceRequestType:GETMR) {
+					if (getDirectoryEntry(in_msg.Addr).Owner.isElement(in_msg.Requestor)) {
+						trigger(Event:GETMO, in_msg.Addr, TBEs[in_msg.Addr]);
+					}
+					else {
+						trigger(Event:GETM, in_msg.Addr, TBEs[in_msg.Addr]);
+					}
+
+				}
+				else if (in_msg.Type == CoherenceRequestType:PUTM) {
+					if (getDirectoryEntry(in_msg.Addr).Owner.isElement(in_msg.Requestor)) {
+						trigger(Event:PUTM, in_msg.Addr, TBEs[in_msg.Addr]);
+					}
+					else {
+						requestNetwork_in.dequeue();
+					}
+				}
+				else if (in_msg.Type == CoherenceRequestType:PUTE) {
+					trigger(Event:PUTE, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else {
+					DPRINTF(RubySLicc, "%s\n", in_msg);
+					error("Invalid message");
+				}
+			}
+		}
+	}
+
+	in_port(requestNetworkWB_in, RequestMsg, requestToDir_WB, rank=0) {
+		if (requestNetworkWB_in.isReady()) {
+			peek(requestNetworkWB_in, RequestMsg) {
+				assert(in_msg.Destination.isElement(machineID));
+				if (in_msg.Type == CoherenceRequestType:GETS) {
+					trigger(Event:GETS, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:GETI) {
+					trigger(Event:GETI, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:GETM) {
+					trigger(Event:GETM, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:PUTM) {
+					if (getDirectoryEntry(in_msg.Addr).Owner.isElement(in_msg.Requestor)) {
+						DPRINTF(RubySlicc, "OWNER DOING PUTM: %s\n", in_msg.Addr);
+						trigger(Event:PUTM, in_msg.Addr, TBEs[in_msg.Addr]);
+					}
+					else {
+						DPRINTF(RubySlicc, "NON-OWNER DOING PUTM: %s %s\n", in_msg.Addr, getDirectoryEntry(in_msg.Addr).Owner);
+						requestNetworkWB_in.dequeue();
+					}
+				}
+				else {
+					DPRINTF(RubySLicc, "%s\n", in_msg);
+					error("Invalid message");
+				}
+			}
+		}
+	}
+
+  in_port(responseNetwork_in, ResponseMsg, responseToDir, rank = 1) {
+    if (responseNetwork_in.isReady()) {
+      peek(responseNetwork_in, ResponseMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+        if (in_msg.Type == CoherenceResponseType:DATA_TO_WB) {
+          trigger(Event:Data, in_msg.Addr, TBEs[in_msg.Addr]);
+        }
+				else if (in_msg.Type == CoherenceResponseType:DATA_TO_WB_O) {
+					trigger(Event:DataO, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceResponseType:NO_DATA) {
+					trigger(Event:No_Data, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else {
+          DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+          error("Invalid message");
+        }
+      }
+    }
+  }
+
+  // off-chip memory request/response is done
+  in_port(memQueue_in, MemoryMsg, responseFromMemory, rank = 2) {
+    if (memQueue_in.isReady()) {
+      peek(memQueue_in, MemoryMsg) {
+        if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
+          trigger(Event:Memory_Data, in_msg.Addr, TBEs[in_msg.Addr]);
+        } 
+				
+				else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
+          trigger(Event:Memory_Ack, in_msg.Addr, TBEs[in_msg.Addr]);
+        }
+				
+				else {
+          DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+          error("Invalid message");
+        }
+      }
+    }
+  }
+
+	
+
+  // Actions
+
+	action(c_clearOwner, "c", desc="clear owner") {
+		getDirectoryEntry(address).Owner.clear();
+	}
+
+
+	action(e_ownerIsRequestor, "e", desc="owner is requestor") {
+		peek(requestNetwork_in, RequestMsg) {
+			getDirectoryEntry(address).Owner.clear();
+			getDirectoryEntry(address).Owner.add(in_msg.Requestor);			
+		}
+	}
+
+  action(d_sendEData, "dex", desc="Send data to requestor") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.Addr := address;
+        out_msg.Type := CoherenceResponseType:EDATA;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.Dirty := false;
+        out_msg.MessageSize := MessageSizeType:Response_Data;       
+      }
+    }
+  }
+
+
+
+  action(d_sendData, "d", desc="Send data to requestor") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.Addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.Dirty := false;
+        out_msg.MessageSize := MessageSizeType:Response_Data;       
+      }
+    }
+  }
+
+
+  action(j_popIncomingRequestQueue, "j", desc="Pop incoming request queue") {
+    requestNetwork_in.dequeue();
+		DPRINTF(RubySlicc, "Popping request network\n");
+  }
+
+	action(j_popIncomingRequestWBQueue, "jwb", desc="Pop incoming WB request queue") {
+		requestNetworkWB_in.dequeue();
+		DPRINTF(RubySlicc, "Popping request WB network\n");
+	}
+
+  action(k_popIncomingResponseQueue, "k", desc="Pop incoming request queue") {
+    responseNetwork_in.dequeue();
+  }
+
+  action(l_popMemQueue, "q", desc="Pop off-chip request queue") {
+    memQueue_in.dequeue();
+  }
+
+  action(kd_wakeUpDependents, "kd", desc="wake-up dependents") {
+    wakeUpBuffers(address);
+  }
+
+  action(qf_queueMemoryFetchRequest, "qf", desc="Queue off-chip fetch request") {
+    peek(requestNetwork_in, RequestMsg) {
+      queueMemoryRead(in_msg.Requestor, address, to_mem_ctrl_latency);
+    }
+  }
+
+  action(qw_queueMemoryWBRequest, "qw", desc="Queue off-chip writeback request") {
+    peek(responseNetwork_in, ResponseMsg) {
+      queueMemoryWrite(in_msg.Sender, address, to_mem_ctrl_latency,
+                       in_msg.DataBlk);
+    }
+  }
+
+
+  action(z_stallAndWaitRequest, "z", desc="recycle request queue") {
+    stall_and_wait(requestNetwork_in, address);
+  }
+
+  //*****************************************************
+  // TRANSITIONS
+  //*****************************************************
+	
+	// *******
+	// Transitions from I
+	// *******	
+
+	transition(I, GETS, IE) {
+		e_ownerIsRequestor;
+		qf_queueMemoryFetchRequest;
+		j_popIncomingRequestQueue;
+	}
+
+	transition(I, GETI, IS) {
+		qf_queueMemoryFetchRequest;
+		j_popIncomingRequestQueue;
+	}
+
+	transition(I, GETM, IM) {
+		e_ownerIsRequestor;
+		qf_queueMemoryFetchRequest;
+		j_popIncomingRequestQueue;
+	}
+
+	transition(IM, {GETM,GETS}) {
+		z_stallAndWaitRequest;
+	}
+
+	transition({IE,IS}, {GETS,GETM}) {
+		z_stallAndWaitRequest;
+	}
+
+	transition(IS, Memory_Data, S) {
+    d_sendData;
+    l_popMemQueue;
+    kd_wakeUpDependents;
+	}
+
+	transition(IE, Memory_Data, M) {
+		d_sendEData;
+		l_popMemQueue;
+		kd_wakeUpDependents;
+	}
+
+	transition(IM, Memory_Data, M) {
+		d_sendData;
+		l_popMemQueue;
+		kd_wakeUpDependents;
+	}
+
+	transition({I,IM,IE,IS}, Memory_Ack) {
+		l_popMemQueue;
+	}
+
+	// *******
+	// Transitions from S
+	// *******
+	
+
+	transition(S, {GETI, GETS}, IS) {
+		qf_queueMemoryFetchRequest;
+		j_popIncomingRequestQueue;
+	}
+
+
+	transition(S, GETM, IM) {
+		e_ownerIsRequestor;
+		qf_queueMemoryFetchRequest;
+		j_popIncomingRequestQueue;
+	}
+
+	transition(S, Memory_Ack) {
+		l_popMemQueue;
+	}
+
+	// *******
+	// Transitions from M
+	// *******
+	
+	transition(M, GETS, MS_D) {
+		j_popIncomingRequestQueue;
+	}
+
+	transition(MS_D, {Data,DataO},  S) {
+		c_clearOwner;
+		qw_queueMemoryWBRequest;
+		k_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+	}
+
+	transition(MS_D, GETS) {
+		j_popIncomingRequestQueue;
+	}
+
+	transition(MS_D, {GETM,GETMO}, M) {
+		c_clearOwner;
+		e_ownerIsRequestor;
+		j_popIncomingRequestQueue;
+	}
+
+	transition(MS_D, No_Data, S) {
+		c_clearOwner;
+		k_popIncomingResponseQueue;
+		kd_wakeUpDependents;
+	}
+
+	transition(M, {PUTE}, MI) {
+		j_popIncomingRequestQueue;
+	}
+
+	transition(M, PUTM, MI) {
+		j_popIncomingRequestWBQueue;
+	}
+	
+	transition(MI, Data, I) {
+		c_clearOwner;
+    qw_queueMemoryWBRequest;
+    k_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+	}
+
+	transition(MI, DataO, S) {
+		c_clearOwner;
+		qw_queueMemoryWBRequest;
+		k_popIncomingResponseQueue;
+		kd_wakeUpDependents;
+	}
+
+	transition(MI, No_Data, I) {
+		c_clearOwner;
+		k_popIncomingResponseQueue;
+		kd_wakeUpDependents;
+	}
+
+	transition(M, GETM) {
+		e_ownerIsRequestor;
+		j_popIncomingRequestQueue;
+	}
+
+	transition(M, GETMO, IM) {
+		c_clearOwner;
+		e_ownerIsRequestor;
+		qf_queueMemoryFetchRequest;
+		j_popIncomingRequestQueue;	
+	}
+
+	transition(MS_D, PUTM) {
+		j_popIncomingRequestWBQueue;
+	}
+
+	transition({MI,M,MS_D}, Memory_Ack) {
+		l_popMemQueue;
+	}
+}

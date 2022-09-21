@@ -1,0 +1,893 @@
+/*
+ * Copyright (c) 1999-2013 Mark D. Hill and David A. Wood
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are
+ * met: redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer;
+ * redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution;
+ * neither the name of the copyright holders nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+machine(Directory, "MSI Two Level directory protocol")
+ : DirectoryMemory * directory;
+   Cycles to_mem_ctrl_latency := 5;
+   Cycles directory_latency := 6;
+
+   MessageBuffer * requestToDir, network="From", virtual_network="2",
+        ordered="false", vnet_type="request";
+	 MessageBuffer * requestToDir_WB, network="From", virtual_network="6",
+	 		  ordered="false", vnet_type="request";
+
+   MessageBuffer * responseToDir, network="From", virtual_network="4",
+        ordered="false", vnet_type="response";
+   MessageBuffer * responseFromDir, network="To", virtual_network="4",
+        ordered="false", vnet_type="response";
+{
+  // STATES
+  state_declaration(State, desc="Directory states", default="Directory_State_I") {
+    // Base states
+    I, AccessPermission:Read_Write, desc="dir is the owner and memory is up-to-date, all other copies are Invalid";
+    ID, AccessPermission:Busy, desc="Intermediate state for DMA_READ when in I";
+    ID_W, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in I";
+
+    M, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
+    IM, AccessPermission:Busy, desc="Intermediate State I>M";
+    MI, AccessPermission:Busy, desc="Intermediate State M>I";
+    M_DRD, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
+    M_DRDI, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
+    M_DWR, AccessPermission:Busy, desc="Intermediate State when there is a dma write";
+    M_DWRI, AccessPermission:Busy, desc="Intermediate State when there is a dma write";
+
+		IS, AccessPermission:Busy, desc="lkndlfsn";
+		IS_A, AccessPermission:Busy, desc="kbsfb";
+
+		M_DM, AccessPermission:Busy, desc="something";
+		M_DS, AccessPermission:Busy, desc="something";
+
+		M_D, AccessPermission:Busy, desc="Something";
+		M_DU, AccessPermission:Busy, desc="Something";
+		M_DUD, AccessPermission:Busy, desc="Something";
+
+        MM, AccessPermission:Maybe_Stale, desc="Something";
+  }
+
+  // Events
+  enumeration(Event, desc="Directory events") {
+    Fetch, desc="A memory fetch arrives";
+    Data, desc="writeback data arrives";
+    Memory_Data, desc="Fetched data from memory arrives";
+    Memory_Ack, desc="Writeback Ack from memory arrives";
+//added by SS for dma
+    DMA_READ, desc="A DMA Read memory request";
+    DMA_WRITE, desc="A DMA Write memory request";
+
+		GETS, desc="A GETS request";
+    PUTM, desc="A putm arrives";
+		GETM, desc="A GETM request";
+    GETMR, desc="A getmr request";
+		GETMO, desc="A GETM request from the Owner. Possibly an upgrade was previously seen";
+		UPG, desc="A UPG request";
+
+		GETSD, desc="A GETS request";
+    PUTMD, desc="A putm arrives";
+		GETMD, desc="A GETM request";
+		GETMOD, desc="A GETM request from the Owner. Possibly an upgrade was previously seen";
+		UPGD, desc="A UPG request";
+        SD, desc="A send data message from above";
+  }
+
+  // TYPES
+
+  // DirectoryEntry
+  structure(Entry, desc="...", interface="AbstractEntry") {
+    State DirectoryState,          desc="Directory state";
+    NetDest Owner, desc="Owner of this block";
+  }
+
+  // TBE entries for DMA requests
+  structure(TBE, desc="TBE entries for outstanding DMA requests") {
+    Address PhysicalAddress, desc="physical address";
+    State TBEState,        desc="Transient State";
+    DataBlock DataBlk,     desc="Data to be written (DMA write only)";
+    int Len,               desc="...";
+
+		NetDest L1_GetS_IDs, desc="Set of the internal processors that want this in shared state";
+		NetDest L1_Get_IDs, desc="Set of the internal processors that want this";
+		MachineID L1_GetM_ID, desc="Processor that wants this in modified state";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Address);
+    void allocate(Address);
+    void deallocate(Address);
+    bool isPresent(Address);
+    bool functionalRead(Packet *pkt);
+    int functionalWrite(Packet *pkt);
+  }
+
+
+  // ** OBJECTS **
+  TBETable TBEs, template="<Directory_TBE>", constructor="m_number_of_TBEs";
+
+  void set_tbe(TBE tbe);
+  void unset_tbe();
+  void wakeUpBuffers(Address a);
+
+  Entry getDirectoryEntry(Address addr), return_by_pointer="yes" {
+    Entry dir_entry := static_cast(Entry, "pointer", directory[addr]);
+
+    if (is_valid(dir_entry)) {
+      return dir_entry;
+    }
+
+    dir_entry :=  static_cast(Entry, "pointer",
+                              directory.allocate(addr, new Entry));
+    return dir_entry;
+  }
+
+  State getState(TBE tbe, Address addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (directory.isPresent(addr)) {
+      return getDirectoryEntry(addr).DirectoryState;
+    } else {
+      return State:I;
+    }
+  }
+
+  void setState(TBE tbe, Address addr, State state) {
+    if (is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+
+    if (directory.isPresent(addr)) {
+      getDirectoryEntry(addr).DirectoryState := state;
+    }
+  }
+
+  AccessPermission getAccessPermission(Address addr) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      DPRINTF(RubySlicc, "%s\n", Directory_State_to_permission(tbe.TBEState));
+      return Directory_State_to_permission(tbe.TBEState);
+    }
+
+    if(directory.isPresent(addr)) {
+      DPRINTF(RubySlicc, "%s\n", Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState));
+      return Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState);
+    }
+
+    DPRINTF(RubySlicc, "%s\n", AccessPermission:NotPresent);
+    return AccessPermission:NotPresent;
+  }
+
+  void functionalRead(Address addr, Packet *pkt) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      functionalMemoryRead(pkt);
+    }
+  }
+
+  int functionalWrite(Address addr, Packet *pkt) {
+    int num_functional_writes := 0;
+
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+        testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+
+    num_functional_writes := num_functional_writes + functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  void setAccessPermission(Address addr, State state) {
+    if (directory.isPresent(addr)) {
+      getDirectoryEntry(addr).changePermission(Directory_State_to_permission(state));
+    }
+  }
+
+
+
+  // ** OUT_PORTS **
+  out_port(responseNetwork_out, ResponseMsg, responseFromDir);
+
+  // ** IN_PORTS **
+
+	in_port(requestNetwork_in, RequestMsg, requestToDir, rank=0) {
+		if (requestNetwork_in.isReady()) {
+			peek(requestNetwork_in, RequestMsg) {
+				assert(in_msg.Destination.isElement(machineID));
+				if (in_msg.Type == CoherenceRequestType:GETS || in_msg.Type == CoherenceRequestType:GETI) {
+					trigger(Event:GETS, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+
+                if (in_msg.Type == CoherenceRequestType:GETMR) {
+					DPRINTF(RubySlicc, "GETMR FOR: %s FROM: %s\n", in_msg.Addr, in_msg.Requestor);
+                    trigger(Event:GETMR, in_msg.Addr, TBEs[in_msg.Addr]);
+                }
+                else if (in_msg.Type == CoherenceRequestType:GETM){
+                    DPRINTF(RubySlicc, "GETM FOR: %s FROM: %s\n", in_msg.Addr, in_msg.Requestor);
+                    trigger(Event:GETM, in_msg.Addr, TBEs[in_msg.Addr]);
+                }
+                /*
+				else if (in_msg.Type == CoherenceRequestType:GETM) {
+					if (getDirectoryEntry(in_msg.Addr).Owner.isElement(in_msg.Requestor)) {
+						trigger(Event:GETMO, in_msg.Addr, TBEs[in_msg.Addr]);
+					}
+					else {
+						DPRINTF(RubySlicc, "GETM FOR: %s FROM: %s\n", in_msg.Addr, in_msg.Requestor);
+						trigger(Event:GETM, in_msg.Addr, TBEs[in_msg.Addr]);
+					}
+				}
+                */
+				else if (in_msg.Type == CoherenceRequestType:UPG) {
+					trigger(Event:UPG, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:PUTM) {
+					if (getDirectoryEntry(in_msg.Addr).Owner.isElement(in_msg.Requestor)) {
+						DPRINTF(RubySlicc, "OWNER DOING PUTM: %s\n", in_msg.Addr);
+						trigger(Event:PUTM, in_msg.Addr, TBEs[in_msg.Addr]);
+					}
+					else {
+						DPRINTF(RubySlicc, "NON-OWNER DOING PUTM: %s\n", in_msg.Addr, getDirectoryEntry(in_msg.Addr).Owner);
+						requestNetwork_in.dequeue();
+					}
+				}
+				else {
+					DPRINTF(RubySLicc, "%s\n", in_msg);
+					error("Invalid message");
+				}
+			}
+		}
+	}
+
+
+	in_port(requestNetworkWB_in, RequestMsg, requestToDir_WB, rank=0) {
+		if (requestNetworkWB_in.isReady()) {
+			peek(requestNetworkWB_in, RequestMsg) {
+				assert(in_msg.Destination.isElement(machineID));
+				if (in_msg.Type == CoherenceRequestType:GETS || in_msg.Type == CoherenceRequestType:GETI) {
+					trigger(Event:GETS, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:GETM) {
+					trigger(Event:GETM, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:UPG) {
+					trigger(Event:UPG, in_msg.Addr, TBEs[in_msg.Addr]);
+				}
+				else if (in_msg.Type == CoherenceRequestType:PUTM) {
+					if (getDirectoryEntry(in_msg.Addr).Owner.isElement(in_msg.Requestor)) {
+						DPRINTF(RubySlicc, "OWNER DOING PUTM: %s\n", in_msg.Addr);
+						trigger(Event:PUTM, in_msg.Addr, TBEs[in_msg.Addr]);
+					}
+					else {
+						DPRINTF(RubySlicc, "NON-OWNER DOING PUTM: %s %s\n", in_msg.Addr, getDirectoryEntry(in_msg.Addr).Owner);
+						requestNetworkWB_in.dequeue();
+					}
+				}
+
+                else if (in_msg.Type == CoherenceRequestType:SD) {
+                    trigger(Event:SD, in_msg.Addr, TBEs[in_msg.Addr]);
+                }
+				else {
+					DPRINTF(RubySLicc, "%s\n", in_msg);
+					error("Invalid message");
+				}
+			}
+		}
+	}
+
+  in_port(responseNetwork_in, ResponseMsg, responseToDir, rank = 1) {
+    if (responseNetwork_in.isReady()) {
+      peek(responseNetwork_in, ResponseMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+        if (in_msg.Type == CoherenceResponseType:DATA_TO_WB) {
+          trigger(Event:Data, in_msg.Addr, TBEs[in_msg.Addr]);
+        }
+				else {
+          DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+          error("Invalid message");
+        }
+      }
+    }
+  }
+
+  // off-chip memory request/response is done
+  in_port(memQueue_in, MemoryMsg, responseFromMemory, rank = 2) {
+    if (memQueue_in.isReady()) {
+      peek(memQueue_in, MemoryMsg) {
+        if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
+          trigger(Event:Memory_Data, in_msg.Addr, TBEs[in_msg.Addr]);
+        } 
+				
+				else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
+          trigger(Event:Memory_Ack, in_msg.Addr, TBEs[in_msg.Addr]);
+        }
+				
+				else {
+          DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+          error("Invalid message");
+        }
+      }
+    }
+  }
+
+	
+
+  // Actions
+
+	action(c_clearOwner, "c", desc="clear owner") {
+		getDirectoryEntry(address).Owner.clear();
+	}
+
+	action(e_ownerIsRequestor, "e", desc="owner is requestor") {
+		peek(requestNetwork_in, RequestMsg) {
+			getDirectoryEntry(address).Owner.clear();
+			getDirectoryEntry(address).Owner.add(in_msg.Requestor);			
+		}
+	}
+
+	action(e_ownerIsRequestorxx, "exx", desc="owner is requestor") {
+		getDirectoryEntry(address).Owner.clear();
+		getDirectoryEntry(address).Owner.add(tbe.L1_GetM_ID);
+	}
+
+
+	action(e_ownerIsRequest, "ewb", desc="owner is requestor wb") {
+		peek(requestNetworkWB_in, RequestMsg) {
+			getDirectoryEntry(address).Owner.clear();
+			getDirectoryEntry(address).Owner.add(in_msg.Requestor);
+		}
+	}
+
+
+  action(a_sendAck, "a", desc="Send ack to L2") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.Addr := address;
+        out_msg.Type := CoherenceResponseType:MEMORY_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+  }
+	
+	action(d_sendDataToCores, "dsc", desc="Send data to whoever requested") {
+		assert(tbe.L1_Get_IDs.count() > 0);	
+		peek(memQueue_in, MemoryMsg) {
+			enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+				out_msg.Addr := address;
+				out_msg.Type := CoherenceResponseType:DATA;
+				out_msg.Sender := machineID;
+				out_msg.Destination := tbe.L1_Get_IDs;
+				out_msg.DataBlk := in_msg.DataBlk;
+				out_msg.Dirty := false;
+				out_msg.MessageSize := MessageSizeType:Response_Data;
+				
+				DPRINTF(RubySlicc, "Send data to requestor: %s\n", out_msg.Destination);
+			}
+		}
+	}
+	
+	action(d_sendDataToCoresRN, "dscRN", desc="Send data to whoever requested") {
+		assert(tbe.L1_Get_IDs.count() > 0);
+		peek(responseNetwork_in, ResponseMsg) {
+			enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+				out_msg.Addr := address;
+				out_msg.Type := CoherenceResponseType:DATA;
+				out_msg.Sender := machineID;
+				out_msg.Destination := tbe.L1_Get_IDs;
+				out_msg.DataBlk := in_msg.DataBlk;
+				out_msg.Dirty := false;
+				out_msg.MessageSize := MessageSizeType:Response_Data;
+				
+				DPRINTF(RubySlicc, "Send data to requestor: %s\n", out_msg.Destination);
+			}
+		}
+	}
+
+
+	action(d_sendDataToSharersRN, "dsRN", desc="Send data to sharers from responseNetwork") {
+		assert(is_valid(tbe));
+		assert(tbe.L1_GetS_IDs.count() > 0);
+		peek(responseNetwork_in, ResponseMsg) {
+			enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+				out_msg.Addr := address;
+				out_msg.Type := CoherenceResponseType:DATA;
+				out_msg.Sender := machineID;
+				out_msg.Destination := tbe.L1_GetS_IDs;
+				out_msg.DataBlk := in_msg.DataBlk;
+				out_msg.Dirty := false;
+					out_msg.MessageSize := MessageSizeType:Response_Data;
+				DPRINTF(RubySlicc, "Send data to requestor: %s\n", out_msg.Destination);
+			}
+		}
+	}
+
+	action(d_sendDataToRequestorRN, "dreqresp", desc="Send data to requestor from ResponseNetwork") {		
+		peek(responseNetwork_in, ResponseMsg) {
+			enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+				out_msg.Addr := address;
+				out_msg.Type := CoherenceResponseType:DATA;
+				out_msg.Sender := machineID;
+				out_msg.Destination.add(tbe.L1_GetM_ID);
+				out_msg.DataBlk := in_msg.DataBlk;
+				out_msg.MessageSize := MessageSizeType:Response_Data;
+				DPRINTF(RubySlicc, "Send data to requestor: %s\n", out_msg.Destination);
+			}
+		}
+	}
+
+	action(d_sendDataToSharers, "ds", desc="Send data to sharers") {
+		assert(is_valid(tbe));
+		assert(tbe.L1_GetS_IDs.count() > 0);
+		peek(memQueue_in, MemoryMsg) {
+			enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+				out_msg.Addr := address;
+				out_msg.Type := CoherenceResponseType:DATA;
+				out_msg.Sender := machineID;
+				out_msg.Destination := tbe.L1_GetS_IDs;
+				out_msg.DataBlk := in_msg.DataBlk;
+				out_msg.Dirty := false;
+					out_msg.MessageSize := MessageSizeType:Response_Data;
+				DPRINTF(RubySlicc, "Send data to requestor: %s\n", out_msg.Destination);
+			}
+		}
+	}
+
+	action(d_sendDataToRequestor, "dreq", desc="Send data to requestor") {
+		peek(memQueue_in, MemoryMsg) {
+			enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+				out_msg.Addr := address;
+				out_msg.Type := CoherenceResponseType:DATA;
+				out_msg.Sender := machineID;
+				out_msg.Destination.add(tbe.L1_GetM_ID);
+				out_msg.DataBlk := in_msg.DataBlk;
+				out_msg.MessageSize := MessageSizeType:Response_Data;
+				DPRINTF(RubySlicc, "Send data to requestor: %s\n", out_msg.Destination);
+			}
+		}
+	}
+
+  action(d_sendData, "d", desc="Send data to requestor") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.Addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.Dirty := false;
+        out_msg.MessageSize := MessageSizeType:Response_Data;       
+				out_msg.SendTime := memQueue_in.dequeue();
+
+
+				// Need more logic here
+				if (out_msg.Destination.smallestNodeID() == 0) {
+					
+					DPRINTF(RubySlicc, "Send data to c0\n");
+					if (inBound(out_msg.SendTime, 0)) {
+						DPRINTF(RubySlicc, "No changes\n");
+						out_msg.SendTime := getCurrentStartSlot(out_msg.SendTime, 0);
+					}
+					else {
+						out_msg.SendTime := getNearestSlot(out_msg.SendTime, 0);
+						DPRINTF(RubySlicc, "New send time: %s\n", out_msg.SendTime);
+					}
+				}
+				else if (out_msg.Destination.smallestNodeID() == 1) {
+					DPRINTF(RubySlicc, "Send data to c1\n");
+					if (inBound(out_msg.SendTime, 1)) {
+						DPRINTF(RubySlicc, "No changes\n");
+						out_msg.SendTime := getCurrentStartSlot(out_msg.SendTime, 1);
+					}
+					else {	
+						out_msg.SendTime := getNearestSlot(out_msg.SendTime, 1);
+						DPRINTF(RubySlicc, "New send time: %s\n", out_msg.SendTime);
+					}
+				}
+				else if (out_msg.Destination.smallestNodeID() == 2) {
+					DPRINTF(RubySlicc, "Send data to c2\n");
+					if (inBound(out_msg.SendTime, 2)) {
+						DPRINTF(RubySlicc, "No changes\n");
+						out_msg.SendTime := getCurrentStartSlot(out_msg.SendTime, 2);
+					}
+					else {
+						out_msg.SendTime := getNearestSlot(out_msg.SendTime, 2);
+						DPRINTF(RubySlicc, "New send time: %s\n", out_msg.SendTime);
+					}
+				}
+				else if (out_msg.Destination.smallestNodeID() == 3) {
+					DPRINTF(RubySlicc, "Send data to c3\n");
+					if (inBound(out_msg.SendTime, 3)) {
+						DPRINTF(RubySlicc, "No changes\n");
+						out_msg.SendTime := getCurrentStartSlot(out_msg.SendTime, 3);
+					}
+					else {
+						out_msg.SendTime := getNearestSlot(out_msg.SendTime, 3);
+						DPRINTF(RubySlicc, "New send time: %s\n", out_msg.SendTime);
+					}
+				}
+				else if (out_msg.Destination.smallestNodeID() == 4) {
+					DPRINTF(RubySlicc, "Send data to c4\n");
+					if (inBound(out_msg.SendTime, 4)) {
+						DPRINTF(RubySlicc, "No changes\n");
+						out_msg.SendTime := getCurrentStartSlot(out_msg.SendTime, 4);
+					}
+					else {
+						out_msg.SendTime := getNearestSlot(out_msg.SendTime, 4);
+						DPRINTF(RubySlicc, "New send time: %s\n", out_msg.SendTime);
+					}
+				}
+				else if (out_msg.Destination.smallestNodeID() == 5) {
+					DPRINTF(RubySlicc, "Send data to c5\n");
+					if (inBound(out_msg.SendTime, 5)) {
+						DPRINTF(RubySlicc, "No changes\n");
+						out_msg.SendTime := getCurrentStartSlot(out_msg.SendTime, 5);
+					}
+					else {
+						out_msg.SendTime := getNearestSlot(out_msg.SendTime, 5);
+						DPRINTF(RubySlicc, "New send time: %s\n", out_msg.SendTime);
+					}
+				}
+				else if (out_msg.Destination.smallestNodeID() == 6) {
+					DPRINTF(RubySlicc, "Send data to c6\n");
+					if (inBound(out_msg.SendTime, 6)) {
+						DPRINTF(RubySlicc, "No changes\n");
+						out_msg.SendTime := getCurrentStartSlot(out_msg.SendTime, 6);
+					}
+					else {
+						out_msg.SendTime := getNearestSlot(out_msg.SendTime, 6);
+						DPRINTF(RubySlicc, "New send time: %s\n", out_msg.SendTime);
+					}
+				}
+				else if (out_msg.Destination.smallestNodeID() == 7) {
+					DPRINTF(RubySlicc, "Send data to c7\n");
+					if (inBound(out_msg.SendTime, 7)) {
+						DPRINTF(RubySlicc, "No changes\n");
+						out_msg.SendTime := getCurrentStartSlot(out_msg.SendTime, 7);
+					}
+					else {
+						out_msg.SendTime := getNearestSlot(out_msg.SendTime, 7);
+						DPRINTF(RubySlicc, "New send time: %s\n", out_msg.SendTime);
+					}
+				}
+				DPRINTF(RubySlicc, "Send data to requestor: %s\n", out_msg.Destination);
+				DPRINTF(RubySlicc, "ST: %s\n", out_msg.SendTime);
+      }
+    }
+  }
+
+
+  // Actions
+  action(aa_sendAck, "aa", desc="Send ack to L2") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.Addr := address;
+        out_msg.Type := CoherenceResponseType:MEMORY_ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+  }
+
+	action(i_allocateTBE, "allocTBE", desc="allocate TBE") {
+		TBEs.allocate(address);
+		set_tbe(TBEs[address]);
+	}
+
+	action(w_deallocateTBE, "wtbe", desc="deallocate TBE") {
+		TBEs.deallocate(address);
+		unset_tbe();
+	}
+
+  action(j_popIncomingRequestQueue, "j", desc="Pop incoming request queue") {
+    requestNetwork_in.dequeue();
+		DPRINTF(RubySlicc, "Popping request network\n");
+  }
+
+	action(j_popIncomingRequestWBQueue, "jwb", desc="Pop incoming WB request queue") {
+		requestNetworkWB_in.dequeue();
+		DPRINTF(RubySlicc, "Popping request WB network\n");
+	}
+
+
+  action(k_popIncomingResponseQueue, "k", desc="Pop incoming request queue") {
+    responseNetwork_in.dequeue();
+  }
+
+  action(l_popMemQueue, "q", desc="Pop off-chip request queue") {
+    memQueue_in.dequeue();
+  }
+
+  action(kd_wakeUpDependents, "kd", desc="wake-up dependents") {
+		DPRINTF(RubySlicc, "WAKING UP DEPEDNENTS %s\n", address);
+    wakeUpBuffers(address);
+  }
+
+  action(qf_queueMemoryFetchRequest, "qf", desc="Queue off-chip fetch request") {
+    peek(requestNetwork_in, RequestMsg) {
+      queueMemoryRead(in_msg.Requestor, address, to_mem_ctrl_latency);
+    }
+  }
+
+	action(qf_queueDirectMemoryFetchRequest, "qfdirecto", desc="Queue off-chip fetch request") {
+		queueMemoryRead(tbe.L1_GetM_ID, address, to_mem_ctrl_latency);
+	}
+	
+	action(qf_queueMemoryFetchRequestWB, "qfwb", desc="Queue off-chip fetch WB request") {
+		peek(requestNetworkWB_in, RequestMsg) {
+			queueMemoryRead(in_msg.Requestor, address, to_mem_ctrl_latency);
+		}
+	}
+
+  action(qw_queueMemoryWBRequest, "qw", desc="Queue off-chip writeback request") {
+    peek(responseNetwork_in, ResponseMsg) {
+      queueMemoryWrite(in_msg.Sender, address, to_mem_ctrl_latency,
+                       in_msg.DataBlk);
+    }
+  }
+
+  action(qf_queueMemoryFetchRequestDMA, "qfd", desc="Queue off-chip fetch request") {
+    peek(requestNetwork_in, RequestMsg) {
+      queueMemoryRead(in_msg.Requestor, address, to_mem_ctrl_latency);
+    }
+  }
+
+	action(qf_queueMemoryFetchRequestWBDMA, "qfdwb", desc="Queue off-chip fetch request WB") {
+		peek(requestNetworkWB_in, RequestMsg) {
+			queueMemoryRead(in_msg.Requestor, address, to_mem_ctrl_latency);
+		}
+	}
+
+  action(p_popIncomingDMARequestQueue, "p", desc="Pop incoming DMA queue") {
+    requestNetwork_in.dequeue();
+  }
+
+  action(dr_sendDMAData, "dr", desc="Send Data to DMA controller from directory") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.Addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.DataBlk := in_msg.DataBlk;   // we send the entire data block and rely on the dma controller to split it up if need be
+        out_msg.Destination.add(map_Address_to_DMA(address));
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+    }
+  }
+
+  action(qw_queueMemoryWBRequest_partial, "qwp",desc="Queue off-chip writeback request") {
+    peek(requestNetwork_in, RequestMsg) {
+      queueMemoryWritePartial(machineID, address, to_mem_ctrl_latency,
+                              in_msg.DataBlk, in_msg.Len);
+    }
+  }
+
+	action(qw_queueMemoryWBRequest_partialWB, "qwpwb", desc="queue off-chip wb request wb") {
+		peek(requestNetworkWB_in, RequestMsg) {
+			queueMemoryWritePartial(machineID, address, to_mem_ctrl_latency, in_msg.DataBlk, in_msg.Len);
+		}
+	}
+
+  action(da_sendDMAAck, "da", desc="Send Ack to DMA controller") {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.Addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Destination.add(map_Address_to_DMA(address));
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+      }
+  }
+
+	action(z_stall, "zs", desc="stall") {
+		// Do nothin
+	}
+
+  action(z_stallAndWaitRequest, "z", desc="recycle request queue") {
+    stall_and_wait(requestNetwork_in, address);
+  }
+
+	action(z_stallAndWaitRequestWB, "zwb", desc="recycle request queue wb") {
+		stall_and_wait(requestNetworkWB_in, address);
+	}
+
+  action(zz_recycleDMAQueue, "zz", desc="recycle DMA queue") {
+    requestNetwork_in.recycle();
+  }
+
+	action(zz_recycleDMAWBQueue, "zzwb", desc="recycle DMA WB queue") {
+		requestNetworkWB_in.recycle();
+	}
+
+	action(ss_recordGetSL1ID, "\s", desc="Record L1 gets") {
+		peek(requestNetwork_in, RequestMsg) {
+			tbe.L1_GetS_IDs.add(in_msg.Requestor);
+			tbe.L1_Get_IDs.add(in_msg.Requestor);
+		}
+	}
+
+
+  action(drp_sendDMAData, "drp", desc="Send Data to DMA controller from incoming PUTX") {
+    peek(responseNetwork_in, ResponseMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.Addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.DataBlk := in_msg.DataBlk;   // we send the entire data block and rely on the dma controller to split it up if need be
+        out_msg.Destination.add(map_Address_to_DMA(address));
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+    }
+  }
+
+  action(v_allocateTBE, "v", desc="Allocate TBE") {
+    peek(requestNetwork_in, RequestMsg) {
+      TBEs.allocate(address);
+      set_tbe(TBEs[address]);
+      tbe.DataBlk := in_msg.DataBlk;
+      tbe.PhysicalAddress := in_msg.Addr;
+      tbe.Len := in_msg.Len;
+    }
+  }
+
+	action(v_allocateTBEWB, "vwb", desc="Allocate TBE WB") {
+		peek(requestNetworkWB_in, RequestMsg) {
+			TBEs.allocate(address);
+			set_tbe(TBEs[address]);
+			tbe.DataBlk := in_msg.DataBlk;
+			tbe.PhysicalAddress := in_msg.Addr;
+			tbe.Len := in_msg.Len;
+		}
+	}
+
+  action(qw_queueMemoryWBRequest_partialTBE, "qwt",desc="Queue off-chip writeback request") {
+    peek(responseNetwork_in, ResponseMsg) {
+      queueMemoryWritePartial(in_msg.Sender, tbe.PhysicalAddress,
+                              to_mem_ctrl_latency, tbe.DataBlk, tbe.Len);
+    }
+  }
+
+
+
+  // TRANSITIONS
+	
+  transition(I, GETS, IS) {
+      i_allocateTBE;
+      ss_recordGetSL1ID;
+      qf_queueMemoryFetchRequest;
+      j_popIncomingRequestQueue;
+  }	
+  
+  transition(I, GETM, IM) {		
+      e_ownerIsRequestor;
+      i_allocateTBE;
+      qf_queueMemoryFetchRequest;
+      j_popIncomingRequestQueue;
+  }
+
+  transition(IS, {GETS,GETM, UPG}) {	
+      z_stallAndWaitRequest;
+  }
+
+  transition(IS, Memory_Data, M) {
+      d_sendData;
+    //l_popMemQueue;
+      w_deallocateTBE;
+      kd_wakeUpDependents;
+  }
+
+  transition(IM, Memory_Data, M) {
+      d_sendData;
+      //l_popMemQueue;
+      kd_wakeUpDependents;
+      w_deallocateTBE;
+  }
+
+  transition(IM, {GETS,GETM,UPG,GETMR}) {
+      z_stallAndWaitRequest;
+  }
+
+  transition(M, {GETS}) {
+      e_ownerIsRequestor
+      j_popIncomingRequestQueue;
+  }
+
+	transition(M_D, {GETS, UPG}) {
+		j_popIncomingRequestQueue;
+	}
+
+	transition(M_D, {GETMR, GETM}, M) {
+		w_deallocateTBE;
+		c_clearOwner;
+		e_ownerIsRequestor;
+		j_popIncomingRequestQueue;
+	}
+	
+  transition(M, {GETM}) {
+      e_ownerIsRequestor;
+      j_popIncomingRequestQueue;
+  }
+  
+  
+  transition(M, GETMR, IM) {
+    i_allocateTBE;
+   qf_queueMemoryFetchRequest;
+   j_popIncomingRequestQueue;
+  }
+  
+   
+  transition(M, UPG, I) {
+      j_popIncomingRequestQueue;
+  }
+
+  transition(I, GETMR, M) {
+      e_ownerIsRequestor;
+      j_popIncomingRequestQueue;
+  }
+
+
+  transition({M_D}, {PUTM,SD}) {		
+      j_popIncomingRequestWBQueue;
+  }
+  
+  transition(M_D, Data, I) {		
+      c_clearOwner;
+      qw_queueMemoryWBRequest;
+      k_popIncomingResponseQueue;
+      w_deallocateTBE;
+      kd_wakeUpDependents;
+  }
+  
+  transition(M, PUTM, MI) {		
+      j_popIncomingRequestWBQueue;
+  }
+
+  transition(I, SD){
+      j_popIncomingRequestWBQueue;
+  }
+
+  transition(M, SD) {
+      j_popIncomingRequestWBQueue;
+  }
+  
+  transition({MI,M}, Data, I) {
+      c_clearOwner;
+      qw_queueMemoryWBRequest;
+      k_popIncomingResponseQueue;
+      kd_wakeUpDependents;
+  }
+  
+  transition({MI,IS_A}, {GETS, GETM, PUTM, UPG}) {
+      z_stallAndWaitRequest;
+  }
+  
+  transition({I, M, MI, IS, IM, IS_A, M_D,M_DS, M_DM}, Memory_Ack) {
+      l_popMemQueue;
+  }
+  
+  transition(I, UPG, M) {	
+      e_ownerIsRequestor;
+      j_popIncomingRequestQueue;
+  }
+}
